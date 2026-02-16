@@ -1,0 +1,97 @@
+[package]
+name = "polymarket-lmsr-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+authors = ["juankaspain"]
+description = "High-frequency LMSR arbitrage bot for Polymarket prediction markets"
+license = "MIT"
+repository = "https://github.com/juankaspain/polymarket-lmsr-bot"
+readme = "README.md"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Blockchain (alloy-rs - successor to ethers-rs)
+alloy = { version = "0.9", features = ["full"] }
+
+# Cryptography for EIP-712 signing
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+
+# Metrics
+prometheus-client = "0.23"
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# Configuration
+dotenvy = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Rate limiting
+governor = "0.8"
+
+# Numeric precision
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"
+
+# UUID for order/trade IDs
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Platform-specific allocator (Linux production only)
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.13"
+criterion = { version = "0.5", features = ["async_tokio"] }
+assert_approx_eq = "1.1"
+tempfile = "3.14"
+
+[[bench]]
+name = "lmsr_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
