@@ -1,4 +1,4 @@
-# Polymarket LMSR Bot — Example Configuration
+# Polymarket LMSR Bot — Example Configuration v0.5.0
 # Copy to config.toml and adjust values for your deployment.
 # Secrets (API keys, wallet keys) go in .env — NEVER here.
 
@@ -42,6 +42,17 @@ min_interval_ms = 1200
 ctf_exchange = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 usdce = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 neg_risk_adapter = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+[wallet]
+hot_fraction = 0.20
+min_matic_balance = 0.5
+hot_alert_threshold = 0.30
+
+[settlement]
+batch_redeem_hour_utc = 4
+max_gas_gwei = 35.0
+tip_gwei = 30.0
+max_fee_gwei = 50.0
 
 [[markets]]
 condition_id = "0x_example_btc_condition"

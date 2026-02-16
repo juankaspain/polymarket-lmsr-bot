@@ -3,6 +3,7 @@
 //! All configuration comes from `config.toml` (never hardcoded).
 //! Secrets come from environment variables (never in config files).
 
+pub mod hot_reload;
 pub mod loader;
 
 use rust_decimal::Decimal;
@@ -29,6 +30,12 @@ pub struct AppConfig {
     pub markets: Vec<MarketConfig>,
     /// Strategy parameters (multi-asset).
     pub strategy: StrategyConfig,
+    /// Wallet allocation parameters (checklist: hot 20%, cold 80%).
+    #[serde(default)]
+    pub wallet: WalletConfig,
+    /// Settlement parameters (batch redeem timing).
+    #[serde(default)]
+    pub settlement: SettlementConfig,
 }
 
 /// Bot identity and operational settings.
@@ -134,3 +141,64 @@ pub struct MarketConfig {
     /// Whether this market is actively traded.
     pub active: bool,
 }
+
+/// Wallet allocation parameters (checklist: hot 20%, cold 80%).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConfig {
+    /// Hot wallet allocation fraction (default 0.20).
+    #[serde(default = "default_hot_fraction")]
+    pub hot_fraction: f64,
+    /// Minimum MATIC balance for gas (default 0.5).
+    #[serde(default = "default_min_matic")]
+    pub min_matic_balance: f64,
+    /// Alert threshold: warn if hot wallet exceeds this fraction.
+    #[serde(default = "default_hot_alert")]
+    pub hot_alert_threshold: f64,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            hot_fraction: 0.20,
+            min_matic_balance: 0.5,
+            hot_alert_threshold: 0.30,
+        }
+    }
+}
+
+fn default_hot_fraction() -> f64 { 0.20 }
+fn default_min_matic() -> f64 { 0.5 }
+fn default_hot_alert() -> f64 { 0.30 }
+
+/// Settlement parameters for batch redemption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementConfig {
+    /// Hour (UTC) to run batch redemption (default 4 = 4 AM).
+    #[serde(default = "default_redeem_hour")]
+    pub batch_redeem_hour_utc: u32,
+    /// Maximum gas price (gwei) for redemption (default 35).
+    #[serde(default = "default_max_gas")]
+    pub max_gas_gwei: f64,
+    /// EIP-1559 priority fee tip (gwei, default 30).
+    #[serde(default = "default_tip")]
+    pub tip_gwei: f64,
+    /// EIP-1559 max fee cap (gwei, default 50).
+    #[serde(default = "default_max_fee")]
+    pub max_fee_gwei: f64,
+}
+
+impl Default for SettlementConfig {
+    fn default() -> Self {
+        Self {
+            batch_redeem_hour_utc: 4,
+            max_gas_gwei: 35.0,
+            tip_gwei: 30.0,
+            max_fee_gwei: 50.0,
+        }
+    }
+}
+
+fn default_redeem_hour() -> u32 { 4 }
+fn default_max_gas() -> f64 { 35.0 }
+fn default_tip() -> f64 { 30.0 }
+fn default_max_fee() -> f64 { 50.0 }

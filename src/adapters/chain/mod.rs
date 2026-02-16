@@ -5,13 +5,16 @@
 //! - CTF contract interactions (balance, redeem)
 //! - ERC-20 approval management (USDCe → CTF, CTF → exchanges)
 //! - Gas price monitoring with EIP-1559 support
+//! - Contract validation at startup (code exists + symbol check)
 
 pub mod approvals;
 pub mod contracts;
 pub mod gas;
 pub mod provider;
+pub mod validator;
 
 pub use approvals::ApprovalManager;
 pub use contracts::CtfContracts;
 pub use gas::GasOracle;
 pub use provider::PolygonProvider;
+pub use validator::ContractValidator;

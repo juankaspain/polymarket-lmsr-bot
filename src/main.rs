@@ -4,16 +4,19 @@
 //! and the main arbitrage engine. Runs until SIGINT/SIGTERM.
 //!
 //! Wiring sequence:
-//! 1. Load config.toml + validate
-//! 2. Init tracing (JSON structured logging)
-//! 3. Load CLOB auth from env vars (POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE)
-//! 4. Create ClobClient (HTTP + auth + retry + rate limit)
-//! 5. Create ClobOrderExecutor (implements OrderExecution port)
-//! 6. Create BinanceFeed (external price oracle for BTC/ETH)
-//! 7. Spawn health server on :9090 (/live + /ready)
-//! 8. Spawn Binance feed supervisor (auto-reconnect WebSocket)
-//! 9. Spawn ArbitrageEngine main loop (event-driven tokio::select!)
-//! 10. Wait for SIGINT → graceful shutdown (cancel→save→exit)
+//!  1. Load config.toml + validate
+//!  2. Init tracing (JSON structured logging)
+//!  3. Connect to Polygon RPC + validate chain ID
+//!  4. Validate contracts on-chain (code exists)
+//!  5. Load CLOB auth from env vars
+//!  6. Create ClobClient + ClobOrderExecutor (OrderExecution port)
+//!  7. Create PolymarketFeed (MarketFeed port) + BinanceFeed + Bridge
+//!  8. Create RepositoryImpl (Repository port)
+//!  9. Spawn health server on :9090 (/live + /ready)
+//! 10. Spawn feeds (Polymarket WS + Binance WS + Bridge)
+//! 11. Spawn config hot-reload watcher (60s)
+//! 12. Spawn ArbitrageEngine main loop (event-driven tokio::select!)
+//! 13. Wait for SIGINT → graceful shutdown (cancel→claim→save→exit)
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -35,7 +38,12 @@ mod usecases;
 use adapters::api::auth::ClobAuth;
 use adapters::api::client::{ClobClient, ClobClientConfig};
 use adapters::api::orders::ClobOrderExecutor;
-use adapters::feeds::BinanceFeed;
+use adapters::chain::provider::PolygonProvider;
+use adapters::chain::ContractValidator;
+use adapters::feeds::{BinanceFeed, FeedBridge, PolymarketFeed};
+use adapters::persistence::RepositoryImpl;
+use config::hot_reload::ConfigWatcher;
+use usecases::arbitrage_engine::ArbitrageEngine;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,12 +75,25 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     let (health_tx, health_rx) = watch::channel(true);
 
-    // ── 4. Load CLOB auth from env vars ─────────────────────
+    // ── 4. Connect to Polygon RPC ───────────────────────────
+    let polygon = PolygonProvider::connect(&config.api)
+        .await
+        .context("Failed to connect to Polygon RPC")?;
+
+    // ── 5. Validate contracts on-chain (checklist) ──────────
+    let validator = ContractValidator::new(polygon.inner());
+    validator
+        .validate_all(&config.contracts)
+        .await
+        .context("Contract validation failed")?;
+    info!("All contracts validated on-chain");
+
+    // ── 6. Load CLOB auth from env vars ─────────────────────
     let auth = Arc::new(
         ClobAuth::from_env().context("Failed to load CLOB credentials from env")?,
     );
 
-    // ── 5. Create CLOB HTTP client with auth + retry ────────
+    // ── 7. Create CLOB HTTP client with auth + retry ────────
     let clob_config = ClobClientConfig {
         base_url: config.api.clob_base_url.clone(),
         timeout: std::time::Duration::from_millis(config.api.timeout_ms),
@@ -85,16 +106,55 @@ async fn main() -> Result<()> {
             .context("Failed to create CLOB client")?,
     );
 
-    // ── 6. Create order executor (OrderExecution port) ──────
+    // ── 8. Create order executor (OrderExecution port) ──────
     let executor = Arc::new(ClobOrderExecutor::new(Arc::clone(&clob_client)));
 
-    // ── 7. Create Binance feed (external BTC/ETH oracle) ────
+    // ── 9. Create feeds ─────────────────────────────────────
+    // Polymarket CLOB WebSocket feed (primary — implements MarketFeed)
+    let pm_feed = Arc::new(PolymarketFeed::new(&config.api));
+
+    // Binance feed (external oracle for cross-validation)
     let binance_feed = Arc::new(BinanceFeed::new());
 
-    // ── 8. Spawn health/metrics server on :9090 ─────────────
+    // Feed bridge (BinanceTick → PriceUpdate for cross-validation)
+    let _feed_bridge = FeedBridge::new(Arc::clone(&binance_feed), &config);
+
+    // ── 10. Create repository (Repository port) ─────────────
+    let repo = Arc::new(
+        RepositoryImpl::from_data_dir("data")
+            .await
+            .context("Failed to initialize repository")?,
+    );
+    info!("Repository initialized in data/");
+
+    // ── 11. Recover state from last run ─────────────────────
+    {
+        use crate::ports::repository::Repository;
+        if let Some(state) = repo.load_latest_state().await? {
+            info!(
+                version = %state.version,
+                open_orders = state.open_orders.len(),
+                cumulative_pnl = state.cumulative_pnl,
+                "Recovered state from previous run"
+            );
+        } else {
+            info!("No previous state found — fresh start");
+        }
+    }
+
+    // ── 12. Spawn health/metrics server on :9090 ────────────
     let health_handle = tokio::spawn(serve_health(health_rx, config.clone()));
 
-    // ── 9. Spawn Binance WebSocket feed with auto-reconnect ─
+    // ── 13. Spawn Polymarket CLOB WebSocket feed ────────────
+    let pm_shutdown = shutdown_tx.subscribe();
+    let pm_ref = Arc::clone(&pm_feed);
+    let pm_handle = tokio::spawn(async move {
+        if let Err(e) = pm_ref.run(pm_shutdown).await {
+            error!(error = %e, "Polymarket feed task failed");
+        }
+    });
+
+    // ── 14. Spawn Binance WebSocket feed ─────────────────────
     let binance_shutdown = shutdown_tx.subscribe();
     let binance_ref = Arc::clone(&binance_feed);
     let binance_handle = tokio::spawn(async move {
@@ -103,25 +163,36 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── 10. Spawn main arbitrage engine ──────────────────────
+    // ── 15. Spawn config hot-reload watcher (60s) ───────────
+    let reload_shutdown = shutdown_tx.subscribe();
+    let (mut config_watcher, _config_rx) =
+        ConfigWatcher::new("config.toml", config.clone());
+    let reload_handle = tokio::spawn(async move {
+        if let Err(e) = config_watcher.run(reload_shutdown).await {
+            error!(error = %e, "Config watcher failed");
+        }
+    });
+
+    // ── 16. Spawn ArbitrageEngine (event-driven main loop) ──
     let engine_shutdown = shutdown_tx.subscribe();
     let engine_config = config.clone();
+    let engine_feed = Arc::clone(&pm_feed);
     let engine_executor = Arc::clone(&executor);
     let engine_handle = tokio::spawn(async move {
-        if let Err(e) = run_engine(
-            engine_config,
+        let mut engine = ArbitrageEngine::new(
+            engine_feed,
             engine_executor,
+            engine_config,
             engine_shutdown,
-        )
-        .await
-        {
+        );
+        if let Err(e) = engine.run().await {
             error!(error = %e, "Arbitrage engine failed");
         }
     });
 
     info!("All tasks spawned — bot is running");
 
-    // ── 11. Wait for SIGINT or SIGTERM ──────────────────────
+    // ── 17. Wait for SIGINT or SIGTERM ──────────────────────
     tokio::select! {
         _ = signal::ctrl_c() => {
             info!("SIGINT received, initiating graceful shutdown");
@@ -144,7 +215,28 @@ async fn main() -> Result<()> {
         Err(e) => warn!(error = %e, "Failed to cancel some orders"),
     }
 
-    // 4. Wait for engine to finish (up to 30s)
+    // 4. Save final state snapshot
+    {
+        use crate::ports::repository::Repository;
+        let final_state = crate::ports::repository::BotStateSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            open_orders: Vec::new(),
+            positions: Vec::new(),
+            cumulative_pnl: 0.0,
+            daily_loss: 0.0,
+        };
+        if let Err(e) = repo.save_state(&final_state).await {
+            warn!(error = %e, "Failed to save final state");
+        } else {
+            info!("Final state snapshot saved");
+        }
+    }
+
+    // 5. Wait for engine (up to 30s)
     info!("Waiting for engine shutdown...");
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -152,93 +244,23 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    // 5. Wait for Binance feed to close (up to 5s)
+    // 6. Wait for feeds (up to 5s each)
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pm_handle,
+    )
+    .await;
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         binance_handle,
     )
     .await;
 
-    // 6. Stop health server
+    // 7. Stop auxiliary tasks
+    reload_handle.abort();
     health_handle.abort();
 
     info!("Shutdown complete");
-    Ok(())
-}
-
-/// Run the main arbitrage engine with fully wired adapters.
-///
-/// Instantiates domain components (LMSR pricer, Kelly sizer, Bayesian
-/// estimator, fee calculator) and the use-case orchestrators (OrderManager,
-/// RiskManager). Runs the event-driven select loop until shutdown.
-async fn run_engine(
-    config: config::AppConfig,
-    executor: Arc<ClobOrderExecutor>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> Result<()> {
-    use crate::domain::bayesian::BayesianEstimator;
-    use crate::domain::fees::FeeCalculator;
-    use crate::domain::kelly::KellySizer;
-    use crate::domain::lmsr::LmsrPricer;
-    use crate::usecases::order_manager::OrderManager;
-    use crate::usecases::risk_manager::RiskManager;
-
-    let _pricer = LmsrPricer::new(config.lmsr.liquidity_parameter);
-    let _sizer = KellySizer::new(config.lmsr.kelly_fraction);
-    let _fees = FeeCalculator::new_maker();
-    let _estimator = BayesianEstimator::new(config.lmsr.prior_weight);
-    let _order_manager = OrderManager::new(Arc::clone(&executor), &config);
-    let _risk_manager = RiskManager::new(&config.risk);
-
-    // Collect active market tokens
-    let active_tokens: Vec<String> = config
-        .markets
-        .iter()
-        .filter(|m| m.active)
-        .map(|m| m.yes_token_id.clone())
-        .collect();
-
-    if active_tokens.is_empty() {
-        warn!("No active markets configured — engine idle");
-        // Wait for shutdown even if idle
-        let _ = shutdown_rx.recv().await;
-        return Ok(());
-    }
-
-    info!(
-        markets = active_tokens.len(),
-        mode = ?config.bot.mode,
-        dry_run = config.bot.dry_run,
-        "Arbitrage engine started with domain components wired"
-    );
-
-    if config.bot.dry_run {
-        warn!("Dry-run mode — signals computed but NO real orders placed");
-    }
-
-    // Engine event loop: wait for shutdown.
-    // The full ArbitrageEngine::run() with MarketFeed subscription
-    // is available for use when a MarketFeed adapter that implements
-    // the port trait is provided. For now, the Binance feed emits
-    // BinanceTick (not PriceUpdate), so we run in standby mode
-    // and log heartbeats until the feed adapter bridge is complete.
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown_rx.recv() => {
-                info!("Engine received shutdown signal");
-                break;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                info!(
-                    active = active_tokens.len(),
-                    "Engine heartbeat — awaiting market feed bridge"
-                );
-            }
-        }
-    }
-
-    info!("Engine stopped cleanly");
     Ok(())
 }
 

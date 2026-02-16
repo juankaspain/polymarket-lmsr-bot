@@ -4,8 +4,8 @@
 # Triggered on push to main and PRs. Steps:
 #   1. cargo fmt --check
 #   2. cargo clippy (pedantic + nursery)
-#   3. cargo test (unit + integration + doc)
-#   4. cargo audit + cargo deny
+#   3. cargo test (unit + integration + proptest + doc)
+#   4. cargo audit + cargo deny (with deny.toml)
 #   5. Docker build + push to GHCR
 #   6. SSH deploy to VPS TradingVPS Amsterdam
 # ─────────────────────────────────────────────────────────────
@@ -101,8 +101,8 @@ jobs:
       - name: Run cargo audit (0 vulnerabilities policy)
         run: cargo audit
 
-      - name: Run cargo deny
-        run: cargo deny check advisories bans licenses sources 2>/dev/null || true
+      - name: Run cargo deny (with deny.toml)
+        run: cargo deny check advisories bans licenses sources
 
   # ── Docker Build & Push ─────────────────────────────────────
   docker:
