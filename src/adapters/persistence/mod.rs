@@ -1,0 +1,11 @@
+//! Persistence Adapters - JSONL-based File Storage
+//!
+//! Implements the Repository port using append-only JSONL files
+//! for trade logs and atomic JSON snapshots for bot state.
+//! No database dependency — lightweight and crash-recoverable.
+
+pub mod state;
+pub mod trades;
+
+pub use state::StateStore;
+pub use trades::TradeLogger;
