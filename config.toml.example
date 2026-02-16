@@ -1,0 +1,131 @@
+# =============================================================================
+# Polymarket LMSR Bot - Configuration
+# Version: 0.1.0
+# Copy this file to config.toml and fill in your values
+# =============================================================================
+
+[bot]
+# Operating mode: "paper" (simulated) or "live" (real money)
+mode = "paper"
+# Log level: "trace", "debug", "info", "warn", "error"
+log_level = "info"
+# Enable JSON structured logging (recommended for production)
+json_logs = false
+# Data directory for state, trades JSONL, and logs
+data_dir = "./data"
+
+[strategy]
+# LMSR liquidity parameter (b). Higher = more liquidity, lower slippage
+lmsr_b = 100.0
+# Minimum edge (%) after fees to trigger a trade
+min_edge_pct = 0.5
+# Maximum position size as fraction of bankroll (quarter-Kelly)
+max_position_fraction = 0.0625
+# Kelly fraction multiplier (0.25 = quarter-Kelly for safety)
+kelly_fraction = 0.25
+# Slippage tolerance (%) - reject if execution deviates more
+max_slippage_pct = 0.3
+# Assets to monitor
+assets = ["BTC", "ETH"]
+
+[strategy.maker]
+# Maker-first strategy: 0% fees + rebates
+enabled = true
+# Order type: always use GTC limit post-only
+order_type = "GTC_POST_ONLY"
+# Price offset from fair value (ticks) to ensure maker fill
+price_offset_ticks = 1
+# Time-to-live for maker orders before cancel (seconds)
+order_ttl_secs = 30
+
+[rate_limits]
+# Polymarket CLOB rate limits
+max_orders_per_minute = 50
+max_orderbook_reads_per_minute = 30
+# Safety margin below actual API limits (actual: 60 orders/min)
+safety_margin_pct = 15
+
+[risk]
+# Maximum daily loss as fraction of starting bankroll
+max_daily_loss_fraction = 0.05
+# Maximum open positions at any time
+max_open_positions = 5
+# Circuit breaker: pause trading after N consecutive losses
+circuit_breaker_consecutive_losses = 3
+# Circuit breaker cooldown (seconds)
+circuit_breaker_cooldown_secs = 300
+# Maximum single trade size (USDC)
+max_trade_size_usdc = 50.0
+# Minimum bankroll to keep trading (USDC)
+min_bankroll_usdc = 10.0
+
+[wallet]
+# Bankroll tracking
+initial_bankroll_usdc = 100.0
+# Reserve ratio: fraction of bankroll kept as reserve (not traded)
+reserve_ratio = 0.20
+# Low balance alert threshold (USDC)
+low_balance_alert_usdc = 25.0
+
+[feeds]
+# Price feed sources (WebSocket)
+[feeds.binance]
+ws_url = "wss://stream.binance.com:9443/ws"
+streams = ["btcusdt@trade", "ethusdt@trade"]
+reconnect_delay_ms = 1000
+max_reconnect_delay_ms = 30000
+reconnect_backoff_multiplier = 2.0
+
+[feeds.coinbase]
+ws_url = "wss://ws-feed.exchange.coinbase.com"
+channels = ["ticker"]
+product_ids = ["BTC-USD", "ETH-USD"]
+reconnect_delay_ms = 1000
+max_reconnect_delay_ms = 30000
+reconnect_backoff_multiplier = 2.0
+
+[polymarket]
+# CLOB API
+clob_http_url = "https://clob.polymarket.com"
+clob_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+[blockchain]
+# Polygon network configuration
+rpc_url = "https://polygon-rpc.com"
+chain_id = 137
+# Contract addresses (loaded from config, NEVER hardcoded)
+usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+ctf_address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+neg_risk_ctf_exchange = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+neg_risk_adapter = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+# Gas optimization
+max_gas_price_gwei = 50
+# Batch redeem schedule (cron-like, daily at 03:00 UTC)
+batch_redeem_schedule = "0 3 * * *"
+
+[settlement]
+# Batch redeem: collect all resolved positions and redeem in 1 tx/day
+enabled = true
+# Minimum positions to batch before redeeming
+min_batch_size = 3
+# Gas price threshold: skip redeem if gas > this (gwei)
+max_gas_gwei_for_redeem = 30
+
+[metrics]
+# Prometheus metrics endpoint
+enabled = true
+host = "0.0.0.0"
+port = 9090
+# Health check endpoint
+health_port = 8080
+
+[notifications]
+# Telegram notifications (optional)
+[notifications.telegram]
+enabled = false
+# bot_token and chat_id from .env (secrets)
+
+# Discord notifications (optional)
+[notifications.discord]
+enabled = false
+# webhook_url from .env (secrets)
