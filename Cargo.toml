@@ -1,6 +1,6 @@
 [package]
 name = "polymarket-lmsr-bot"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.82"
 description = "LMSR-based market making bot for Polymarket prediction markets"
@@ -19,6 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # WebSocket (rustls to match reqwest — NEVER native-tls)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Async stream combinators (SinkExt, StreamExt for WebSocket feeds)
+futures-util = "0.3"
 
 # Serialization — pinned =1.0.219 (last version before serde_core split that breaks alloy 0.9)
 serde = { version = "=1.0.219", features = ["derive"] }

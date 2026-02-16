@@ -60,6 +60,7 @@ impl ClobOrderExecutor {
     /// Check orderbook depth and slippage before trade (checklist requirement).
     ///
     /// Returns Ok(avg_fill_price) if slippage is acceptable, Err if >2%.
+    /// Parses string-typed price/size from `OrderBookLevel`.
     async fn check_slippage(
         &self,
         token_id: &str,
@@ -72,22 +73,30 @@ impl ClobOrderExecutor {
             .await
             .context("Failed to fetch orderbook for slippage check")?;
 
-        let levels = match side {
+        // Parse string levels into (price, size) tuples
+        let levels: Vec<(f64, f64)> = match side {
             TradeSide::Buy => &book.asks,
             TradeSide::Sell => &book.bids,
-        };
+        }
+        .iter()
+        .filter_map(|l| {
+            let price = l.price.parse::<f64>().ok()?;
+            let sz = l.size.parse::<f64>().ok()?;
+            Some((price, sz))
+        })
+        .collect();
 
         if levels.is_empty() {
-            bail!("No orderbook depth for {token_id} on {:?} side", side);
+            bail!("No orderbook depth for {token_id} on {side:?} side");
         }
 
         // Compute weighted average fill price
         let mut remaining = size;
         let mut total_cost = 0.0;
 
-        for level in levels {
-            let fill = remaining.min(level.size);
-            total_cost += fill * level.price;
+        for (price, level_size) in &levels {
+            let fill = remaining.min(*level_size);
+            total_cost += fill * price;
             remaining -= fill;
             if remaining <= 0.0 {
                 break;
@@ -96,21 +105,17 @@ impl ClobOrderExecutor {
 
         if remaining > 0.0 {
             bail!(
-                "Insufficient orderbook depth: {:.2} unfilled of {:.2}",
-                remaining,
-                size
+                "Insufficient orderbook depth: {remaining:.2} unfilled of {size:.2}"
             );
         }
 
         let avg_fill = total_cost / size;
-        let best_price = levels[0].price;
+        let best_price = levels[0].0;
         let slippage_pct = ((avg_fill - best_price) / best_price).abs() * 100.0;
 
         if slippage_pct > MAX_SLIPPAGE_PCT {
             bail!(
-                "Slippage {:.2}% exceeds {:.1}% threshold",
-                slippage_pct,
-                MAX_SLIPPAGE_PCT,
+                "Slippage {slippage_pct:.2}% exceeds {MAX_SLIPPAGE_PCT:.1}% threshold"
             );
         }
 
@@ -138,7 +143,10 @@ impl OrderExecution for ClobOrderExecutor {
         }
 
         // Pre-trade slippage check (checklist: check_orderbook_depth BEFORE trade)
-        if let Err(e) = self.check_slippage(&order.token_id, order.side, order.size).await {
+        if let Err(e) = self
+            .check_slippage(&order.token_id, order.side, order.size)
+            .await
+        {
             warn!(error = %e, "Slippage check failed, skipping order");
             return Ok(OrderPlacement {
                 order_id: String::new(),
@@ -165,12 +173,15 @@ impl OrderExecution for ClobOrderExecutor {
 
         let body = serde_json::to_string(&payload)?;
 
-        // Use shared ClobClient which handles HMAC auth automatically
-        let response = self
+        // Send via ClobClient (HMAC auth + retry handled internally)
+        let response: serde_json::Value = self
             .client
             .post("/order", &body)
             .await
-            .context("Failed to place order via CLOB")?;
+            .context("Failed to place order via CLOB")?
+            .json()
+            .await
+            .context("Failed to parse place_order response")?;
 
         // Parse response
         let order_id = response["orderID"]
@@ -210,11 +221,14 @@ impl OrderExecution for ClobOrderExecutor {
         let payload = serde_json::json!({ "orderID": order_id });
         let body = serde_json::to_string(&payload)?;
 
-        let response = self
+        let response: serde_json::Value = self
             .client
             .delete("/order", &body)
             .await
-            .context("Failed to cancel order")?;
+            .context("Failed to cancel order")?
+            .json()
+            .await
+            .context("Failed to parse cancel_order response")?;
 
         let success = response["success"].as_bool().unwrap_or(false);
 
@@ -231,11 +245,14 @@ impl OrderExecution for ClobOrderExecutor {
 
     #[instrument(skip(self))]
     async fn cancel_all_orders(&self) -> Result<usize> {
-        let response = self
+        let response: serde_json::Value = self
             .client
             .delete("/order/all", "")
             .await
-            .context("Failed to cancel all orders")?;
+            .context("Failed to cancel all orders")?
+            .json()
+            .await
+            .context("Failed to parse cancel_all response")?;
 
         let count = response["cancelled"]
             .as_u64()
@@ -252,11 +269,14 @@ impl OrderExecution for ClobOrderExecutor {
         let payload = serde_json::json!({ "tokenID": token_id });
         let body = serde_json::to_string(&payload)?;
 
-        let response = self
+        let response: serde_json::Value = self
             .client
             .delete("/order/token", &body)
             .await
-            .context("Failed to cancel orders for token")?;
+            .context("Failed to cancel orders for token")?
+            .json()
+            .await
+            .context("Failed to parse cancel_orders_for_token response")?;
 
         let cancelled = response["cancelled"]
             .as_array()
@@ -276,12 +296,15 @@ impl OrderExecution for ClobOrderExecutor {
     }
 
     async fn get_order_status(&self, order_id: &OrderId) -> Result<OrderStatus> {
-        let path = format!("/order/{}", order_id);
-        let response = self
+        let path = format!("/order/{order_id}");
+        let response: serde_json::Value = self
             .client
             .get(&path)
             .await
-            .context("Failed to get order status")?;
+            .context("Failed to get order status")?
+            .json()
+            .await
+            .context("Failed to parse order status response")?;
 
         let status_str = response["status"].as_str().unwrap_or("UNKNOWN");
 
@@ -314,11 +337,14 @@ impl OrderExecution for ClobOrderExecutor {
     }
 
     async fn get_open_orders(&self) -> Result<Vec<Order>> {
-        let response = self
+        let response: serde_json::Value = self
             .client
             .get("/orders/open")
             .await
-            .context("Failed to get open orders")?;
+            .context("Failed to get open orders")?
+            .json()
+            .await
+            .context("Failed to parse open orders response")?;
 
         let orders = response
             .as_array()
@@ -333,11 +359,14 @@ impl OrderExecution for ClobOrderExecutor {
     }
 
     async fn available_balance(&self, _side: TradeSide) -> Result<f64> {
-        let response = self
+        let response: serde_json::Value = self
             .client
             .get("/balance")
             .await
-            .context("Failed to get balance")?;
+            .context("Failed to get balance")?
+            .json()
+            .await
+            .context("Failed to parse balance response")?;
 
         let balance = response["available"]
             .as_f64()
@@ -347,7 +376,7 @@ impl OrderExecution for ClobOrderExecutor {
     }
 
     async fn is_healthy(&self) -> bool {
-        self.client.get("/time").await.is_ok()
+        self.client.health_check().await
     }
 
     async fn rate_limit_status(&self) -> (u32, u64) {

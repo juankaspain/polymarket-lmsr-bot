@@ -17,6 +17,18 @@ use base64::Engine;
 /// system clock; counter increments atomically per request.
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Bundle of non-secret credentials for request headers.
+///
+/// Contains the API key and passphrase (NOT the secret).
+/// Used by `ClobClient` to attach auth headers to requests.
+#[derive(Debug, Clone)]
+pub struct ClobCredentials {
+    /// API key from POLY_API_KEY env var.
+    pub api_key: String,
+    /// Passphrase from POLY_PASSPHRASE env var.
+    pub api_passphrase: String,
+}
+
 /// CLOB API authentication handler.
 ///
 /// Manages API key, secret, and passphrase loaded from env vars.
@@ -68,6 +80,17 @@ impl ClobAuth {
         &self.passphrase
     }
 
+    /// Return non-secret credentials bundle for auth headers.
+    ///
+    /// Used by `ClobClient::execute_with_retry()` to attach
+    /// POLY_API_KEY and POLY_PASSPHRASE headers.
+    pub fn credentials(&self) -> Option<ClobCredentials> {
+        Some(ClobCredentials {
+            api_key: self.api_key.clone(),
+            api_passphrase: self.passphrase.clone(),
+        })
+    }
+
     /// Generate a unique nonce using timestamp_seed + atomic increment.
     ///
     /// This ensures no two requests share a nonce even under
@@ -78,7 +101,10 @@ impl ClobAuth {
     }
 
     /// Generate the current Unix timestamp in seconds (for signing).
-    pub fn timestamp(&self) -> String {
+    ///
+    /// Associated function (no `&self`) so `ClobClient` can call it
+    /// as `ClobAuth::timestamp()` without borrowing the auth instance.
+    pub fn timestamp() -> String {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -105,6 +131,20 @@ impl ClobAuth {
         base64::engine::general_purpose::STANDARD.encode(mac)
     }
 
+    /// Sign a request, returning Result for use in fallible contexts.
+    ///
+    /// Thin wrapper over `sign()` that matches the call-site in
+    /// `ClobClient::execute_with_retry()` which expects `Result<String>`.
+    pub fn sign_request(
+        &self,
+        timestamp: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<String> {
+        Ok(self.sign(timestamp, method, path, body))
+    }
+
     /// Build all authentication headers for a CLOB request.
     ///
     /// Returns (key, timestamp, signature, passphrase) tuple.
@@ -115,7 +155,7 @@ impl ClobAuth {
         path: &str,
         body: &str,
     ) -> (String, String, String, String) {
-        let timestamp = self.timestamp();
+        let timestamp = Self::timestamp();
         let signature = self.sign(&timestamp, method, path, body);
         (
             self.api_key.clone(),
