@@ -1,79 +1,87 @@
 [package]
 name = "polymarket-lmsr-bot"
-version = "0.1.0"
-edition = "2024"  # ✅ CORREGIDO - Última edition estable
-rust-version = "1.93.1"
-authors = ["Your Name <your.email@example.com>"]
-description = "High-frequency arbitrage bot for Polymarket prediction markets"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.82"
+description = "LMSR-based market making bot for Polymarket prediction markets"
 license = "MIT"
-repository = "https://github.com/yourusername/polymarket-lmsr-bot"
+repository = "https://github.com/juankaspain/polymarket-lmsr-bot"
 
 [dependencies]
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-futures = "0.3"
 
-# Blockchain (Polygon via alloy-rs)
+# Blockchain (alloy-rs 0.9 — NEVER ethers-rs)
 alloy = { version = "0.9", features = ["full"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
-governor = "0.6"  # Rate limiting
+# HTTP client (rustls only — no native-tls anywhere)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# WebSocket (rustls to match reqwest — NEVER native-tls)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
-# Logging & Observability
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-prometheus = "0.13"
-axum = "0.7"  # For health endpoints
+# Async traits (needed until Rust stabilizes async fn in traits for dyn dispatch)
+async-trait = "0.1"
 
-# Cryptography
-ethers-signers = "2.0"  # For EIP-712 signatures (transitioning to alloy)
+# CLOB auth: HMAC-SHA256 signing + base64 encoding
+hmac-sha256 = "1.1"
+base64 = "0.22"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
-# Time & Math
-chrono = { version = "0.4", features = ["serde"] }
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Metrics (Prometheus — checklist pinned 0.13)
+prometheus = "0.13"
+
+# HTTP server for health/metrics endpoints
+axum = "0.7"
+
+# Rate limiting (checklist pinned 0.6)
+governor = "0.6"
+
+# Precise decimal arithmetic for financial calculations
 rust_decimal = "1.36"
+rust_decimal_macros = "1.36"
 
-# Configuration
-config = "0.14"
-dotenv = "0.15"
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
 
-# Task supervision
-task-supervisor = "0.3"
+# UUID generation for order/trade IDs
+uuid = { version = "1.11", features = ["v4", "serde"] }
 
-# Allocator (Linux only, Windows uses default)
-[target.'cfg(all(not(target_env = "msvc"), target_os = "linux"))'.dependencies]
+# Memory allocator — jemalloc on Linux prod only (NEVER on Windows/MSVC dev)
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 # Testing
-proptest = "1.5"
 mockall = "0.13"
+proptest = "1.5"
 tokio-test = "0.4"
 
-[profile.dev]
-opt-level = 0
-debug = true
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "lmsr_bench"
+harness = false
 
 [profile.release]
-opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+opt-level = 3
 
-[profile.test]
-opt-level = 1
-
-[[bin]]
-name = "polymarket-bot"
-path = "src/main.rs"
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"
