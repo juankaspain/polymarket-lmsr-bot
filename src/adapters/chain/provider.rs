@@ -3,14 +3,15 @@
 //! Manages the connection to the Polygon PoS chain via alloy-rs.
 //! Validates RPC connectivity at startup and exposes a shared provider
 //! instance for all on-chain operations.
+//!
+//! In alloy 0.9, `ProviderBuilder::new().on_http()` returns a complex
+//! filler type. We store it as a type-erased `dyn Provider` to keep
+//! the API clean across the adapter layer.
 
 use std::sync::Arc;
 
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
-use alloy::network::Ethereum;
-use alloy::transports::http::Http;
+use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::{Context, Result};
-use reqwest::Client;
 use tracing::{info, instrument};
 
 use crate::config::ApiConfig;
@@ -19,9 +20,13 @@ use crate::config::ApiConfig;
 ///
 /// All chain adapters share a single provider instance to avoid
 /// redundant connections and enable connection pooling.
+///
+/// Uses `dyn Provider` for type erasure because alloy 0.9's
+/// `ProviderBuilder::new().on_http()` returns a deeply-nested
+/// generic filler type that would leak implementation details.
 pub struct PolygonProvider {
-    /// The alloy HTTP provider connected to Polygon RPC.
-    provider: Arc<RootProvider<Http<Client>>>,
+    /// The alloy HTTP provider connected to Polygon RPC (type-erased).
+    provider: Arc<dyn Provider + Send + Sync>,
     /// RPC endpoint URL (for diagnostics, never logged with secrets).
     #[allow(dead_code)]
     rpc_url: String,
@@ -37,11 +42,12 @@ impl PolygonProvider {
     pub async fn connect(config: &ApiConfig) -> Result<Self> {
         let rpc_url = config.rpc_url.clone();
 
-        // NOTE: on_http() is synchronous in alloy 0.9 — no .await
+        // alloy 0.9: on_http() is synchronous, returns impl Provider
         let provider = ProviderBuilder::new()
             .on_http(rpc_url.parse().context("Invalid RPC URL")?);
 
-        let provider = Arc::new(provider);
+        // Wrap in Arc<dyn Provider> for type erasure
+        let provider: Arc<dyn Provider + Send + Sync> = Arc::new(provider);
 
         // Validate chain ID at startup
         let chain_id = provider
@@ -60,8 +66,8 @@ impl PolygonProvider {
         Ok(Self { provider, rpc_url })
     }
 
-    /// Get a shared reference to the alloy provider.
-    pub fn inner(&self) -> Arc<RootProvider<Http<Client>>> {
+    /// Get a shared reference to the alloy provider (type-erased).
+    pub fn inner(&self) -> Arc<dyn Provider + Send + Sync> {
         Arc::clone(&self.provider)
     }
 

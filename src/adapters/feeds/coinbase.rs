@@ -118,9 +118,11 @@ impl CoinbaseFeed {
         };
 
         let sub_json = serde_json::to_string(&subscribe)?;
+
+        // tungstenite 0.24: Message::Text takes Utf8Bytes, use .into() for String → Utf8Bytes.
         use futures_util::SinkExt;
         write
-            .send(tokio_tungstenite::tungstenite::Message::Text(sub_json))
+            .send(tokio_tungstenite::tungstenite::Message::Text(sub_json.into()))
             .await
             .context("Failed to send subscribe")?;
 
@@ -133,8 +135,9 @@ impl CoinbaseFeed {
                 }
                 msg = read.next() => {
                     match msg {
+                        // tungstenite 0.24: text is Utf8Bytes, use .as_ref() for &str.
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            let _ = self.handle_message(&text).await;
+                            let _ = self.handle_message(text.as_ref()).await;
                         }
                         Some(Err(e)) => {
                             return Err(anyhow::anyhow!("Coinbase WS error: {e}"));

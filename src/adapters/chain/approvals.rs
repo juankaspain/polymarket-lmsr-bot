@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use alloy::primitives::{Address, U256, Bytes, keccak256};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use tracing::{info, instrument, warn};
@@ -117,9 +117,10 @@ impl ApprovalManager {
         spender_padded[12..].copy_from_slice(spender.as_slice());
         calldata.extend_from_slice(&spender_padded);
 
+        // alloy 0.9: use TransactionInput::new() for the input field
         let tx = TransactionRequest::default()
             .to(token)
-            .input(Bytes::from(calldata).into());
+            .input(TransactionInput::new(Bytes::from(calldata)));
 
         let result = inner
             .call(&tx)

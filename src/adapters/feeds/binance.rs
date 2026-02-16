@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{broadcast, RwLock};
@@ -133,14 +132,16 @@ impl BinanceFeed {
                 }
                 msg = read.next() => {
                     match msg {
+                        // tungstenite 0.24: Message::Text wraps Utf8Bytes, not String.
+                        // Use .as_ref() to get &str for handle_message.
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            if let Err(e) = self.handle_message(&text).await {
+                            if let Err(e) = self.handle_message(text.as_ref()).await {
                                 debug!(error = %e, "Failed to parse Binance message");
                             }
                         }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_data))) => {
                             // Pong is handled automatically by tungstenite
-                            debug!(len = data.len(), "Binance ping received");
+                            debug!("Binance ping received");
                         }
                         Some(Err(e)) => {
                             return Err(anyhow::anyhow!("WebSocket error: {e}"));

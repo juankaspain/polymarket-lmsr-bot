@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256, Bytes, keccak256};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tracing::{info, instrument, warn};
@@ -109,9 +109,10 @@ impl ChainClient for CtfContracts {
 
         let calldata = Self::encode_balance_of(wallet_addr);
 
+        // alloy 0.9: use TransactionInput::new() for the input field
         let tx = TransactionRequest::default()
             .to(self.addresses.usdce)
-            .input(calldata.into());
+            .input(TransactionInput::new(calldata));
 
         let result = inner
             .call(&tx)
