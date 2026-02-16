@@ -3,11 +3,14 @@
 //! Implements fractional Kelly for optimal bankroll management.
 //! We use quarter-Kelly (0.25x) by default for safety, which reduces
 //! variance significantly while retaining ~75% of the growth rate.
+//!
+//! Exposes both `KellyCriterion` (Decimal API) and `KellySizer` (f64 API).
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 
-/// Kelly Criterion calculator for optimal position sizing.
+/// Kelly Criterion calculator for optimal position sizing (Decimal API).
 ///
 /// Full Kelly maximizes long-term growth rate but has high variance.
 /// We use fractional Kelly (default 0.25) for production safety.
@@ -36,8 +39,6 @@ impl KellyCriterion {
     ///   p = probability of winning (our estimated fair price)
     ///   q = 1 - p
     ///   b = odds offered (payout ratio)
-    ///
-    /// Returns the fraction of bankroll to bet (0.0 if negative edge).
     pub fn optimal_fraction(
         &self,
         estimated_prob: Decimal,
@@ -47,18 +48,15 @@ impl KellyCriterion {
             return Decimal::ZERO;
         }
 
-        // Payout ratio: if we buy at market_price, we get 1.0 on win
         let b = (Decimal::ONE - market_price) / market_price;
         let q = Decimal::ONE - estimated_prob;
 
-        // Full Kelly fraction
         let full_kelly = (estimated_prob * b - q) / b;
 
         if full_kelly <= Decimal::ZERO {
             return Decimal::ZERO;
         }
 
-        // Apply fractional Kelly and cap at max position
         let sized = full_kelly * self.fraction;
         sized.min(self.max_position_fraction)
     }
@@ -85,47 +83,67 @@ impl Default for KellyCriterion {
     }
 }
 
+// ────────────────────────────────────────────
+// KellySizer — f64 boundary API for usecases
+// ────────────────────────────────────────────
+
+/// Lightweight f64 wrapper around KellyCriterion for use at the ports boundary.
+///
+/// Accepts and returns `f64` so usecases/adapters never import `Decimal`.
+#[derive(Debug, Clone)]
+pub struct KellySizer {
+    inner: KellyCriterion,
+}
+
+impl KellySizer {
+    /// Create a sizer with the given Kelly fraction (e.g., 0.25 for quarter-Kelly).
+    pub fn new(fraction: f64) -> Self {
+        let frac = Decimal::from_f64(fraction).unwrap_or(dec!(0.25));
+        Self {
+            inner: KellyCriterion::new(frac, dec!(0.0625)),
+        }
+    }
+
+    /// Compute optimal position size in USDC.
+    ///
+    /// Returns the dollar amount to risk on this trade.
+    pub fn optimal_size(
+        &self,
+        estimated_prob: f64,
+        market_price: f64,
+        bankroll: f64,
+    ) -> f64 {
+        let prob = Decimal::from_f64(estimated_prob).unwrap_or(dec!(0.5));
+        let price = Decimal::from_f64(market_price).unwrap_or(dec!(0.5));
+        let bank = Decimal::from_f64(bankroll).unwrap_or(Decimal::ZERO);
+
+        self.inner
+            .position_size_usdc(bank, prob, price)
+            .to_f64()
+            .unwrap_or(0.0)
+    }
+
+    /// Compute optimal fraction (0.0 – 1.0).
+    pub fn optimal_fraction(&self, estimated_prob: f64, market_price: f64) -> f64 {
+        let prob = Decimal::from_f64(estimated_prob).unwrap_or(dec!(0.5));
+        let price = Decimal::from_f64(market_price).unwrap_or(dec!(0.5));
+
+        self.inner
+            .optimal_fraction(prob, price)
+            .to_f64()
+            .unwrap_or(0.0)
+    }
+
+    /// Access the underlying precise calculator.
+    pub fn inner(&self) -> &KellyCriterion {
+        &self.inner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_kelly_positive_edge() {
-        let kelly = KellyCriterion::default();
-        // Fair price 0.60, market price 0.45 -> positive edge
-        let f = kelly.optimal_fraction(dec!(0.60), dec!(0.45));
-        assert!(f > Decimal::ZERO, "Should have positive position for edge");
-    }
-
-    #[test]
-    fn test_kelly_no_edge() {
-        let kelly = KellyCriterion::default();
-        // Fair price equals market price -> no edge
-        let f = kelly.optimal_fraction(dec!(0.50), dec!(0.50));
-        assert_eq!(f, Decimal::ZERO, "No edge should give zero position");
-    }
-
-    #[test]
-    fn test_kelly_negative_edge() {
-        let kelly = KellyCriterion::default();
-        // Fair price 0.40, market price 0.50 -> negative edge
-        let f = kelly.optimal_fraction(dec!(0.40), dec!(0.50));
-        assert_eq!(f, Decimal::ZERO, "Negative edge should give zero position");
-    }
-
-    #[test]
-    fn test_kelly_capped_at_max() {
-        let kelly = KellyCriterion::new(dec!(1.0), dec!(0.0625));
-        // Full Kelly with huge edge should still be capped
-        let f = kelly.optimal_fraction(dec!(0.90), dec!(0.10));
-        assert!(f <= dec!(0.0625), "Position should be capped at max fraction");
-    }
-
-    #[test]
-    fn test_position_size_usdc() {
-        let kelly = KellyCriterion::default();
-        let size = kelly.position_size_usdc(dec!(100.0), dec!(0.60), dec!(0.45));
-        assert!(size > Decimal::ZERO);
-        assert!(size <= dec!(6.25), "Should not exceed 6.25% of bankroll");
-    }
-}
+        let k
