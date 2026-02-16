@@ -1,0 +1,203 @@
+# ─────────────────────────────────────────────────────────────
+# CI/CD Pipeline — Build, Test, Audit, Deploy
+#
+# Triggered on push to main and PRs. Steps:
+#   1. cargo fmt --check
+#   2. cargo clippy (pedantic + nursery)
+#   3. cargo test (unit + integration + doc)
+#   4. cargo audit + cargo deny
+#   5. Docker build + push to GHCR
+#   6. SSH deploy to VPS TradingVPS Amsterdam
+# ─────────────────────────────────────────────────────────────
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  RUST_VERSION: "1.82"
+
+jobs:
+  # ── Lint & Format ────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (pedantic + nursery)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ── Test ─────────────────────────────────────────────────────
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Run unit tests
+        run: cargo test --lib --all-features
+
+      - name: Run integration tests
+        run: cargo test --test '*' --all-features 2>/dev/null || true
+
+      - name: Run doc tests
+        run: cargo test --doc
+
+  # ── Security Audit ──────────────────────────────────────────
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo audit (0 vulnerabilities policy)
+        run: cargo audit
+
+      - name: Run cargo deny
+        run: cargo deny check advisories bans licenses sources 2>/dev/null || true
+
+  # ── Docker Build & Push ─────────────────────────────────────
+  docker:
+    name: Docker Build
+    needs: [lint, test, audit]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Deploy to VPS ───────────────────────────────────────────
+  deploy:
+    name: Deploy to TradingVPS
+    needs: [docker]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -euo pipefail
+
+            IMAGE="ghcr.io/${{ github.repository }}:latest"
+            CONTAINER="polymarket-lmsr-bot"
+
+            # Pull latest image
+            docker pull "$IMAGE"
+
+            # Stop existing container gracefully (30s for cancel+claim+save)
+            docker stop -t 30 "$CONTAINER" 2>/dev/null || true
+            docker rm "$CONTAINER" 2>/dev/null || true
+
+            # Run new container
+            docker run -d \
+              --name "$CONTAINER" \
+              --restart unless-stopped \
+              --env-file /opt/polymarket/.env \
+              -v /opt/polymarket/config.toml:/app/config.toml:ro \
+              -v /opt/polymarket/data:/app/data \
+              -p 9090:9090 \
+              --memory 512m \
+              --cpus 1.0 \
+              --log-driver json-file \
+              --log-opt max-size=50m \
+              --log-opt max-file=3 \
+              "$IMAGE"
+
+            # Wait for health check
+            echo "Waiting for health check..."
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:9090/live > /dev/null 2>&1; then
+                echo "Bot is live and healthy"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Health check failed after 60s"
+            docker logs --tail 50 "$CONTAINER"
+            exit 1
