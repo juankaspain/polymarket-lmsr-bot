@@ -20,8 +20,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # WebSocket (rustls to match reqwest — NEVER native-tls)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
+# Serialization — pinned to <1.0.228 (serde_core split breaks alloy 0.9)
+serde = { version = ">=1.0.171, <1.0.228", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
