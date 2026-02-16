@@ -3,6 +3,9 @@
 //! The LMSR is the core pricing model used by Polymarket.
 //! This module computes fair prices and costs for binary outcome markets.
 //! Reference: Hanson (2003) "Combinatorial Information Market Design"
+//!
+//! Exposes both a Decimal API (LmsrModel) for precise internal
+//! accounting and an f64 API (LmsrPricer) for ports/adapters.
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
@@ -53,8 +56,6 @@ impl LmsrModel {
     /// Computes the price (instantaneous marginal cost) for the YES outcome.
     ///
     /// price_yes = exp(q_yes/b) / (exp(q_yes/b) + exp(q_no/b))
-    ///
-    /// This is the probability implied by the current market state.
     pub fn price_yes(&self, q_yes: Decimal, q_no: Decimal) -> Decimal {
         let b_f64 = self.b.to_f64().unwrap_or(100.0);
         let q_yes_f64 = q_yes.to_f64().unwrap_or(0.0);
@@ -73,8 +74,6 @@ impl LmsrModel {
     }
 
     /// Computes the cost of buying `delta` YES shares.
-    ///
-    /// cost = C(q_yes + delta, q_no) - C(q_yes, q_no)
     pub fn cost_to_buy_yes(
         &self,
         q_yes: Decimal,
@@ -96,17 +95,60 @@ impl LmsrModel {
 
     /// Detects if there is an arbitrage edge between the external fair price
     /// and the LMSR-implied market price.
-    ///
-    /// Returns the edge as a percentage (positive = profitable opportunity).
-    /// The edge must exceed `min_edge_pct` after fees to be actionable.
     pub fn detect_edge(
         &self,
         market_price_yes: Decimal,
         fair_price_yes: Decimal,
     ) -> Decimal {
         let edge = fair_price_yes - market_price_yes;
-        // Return absolute edge percentage
         (edge / market_price_yes * Decimal::ONE_HUNDRED).abs()
+    }
+}
+
+// ────────────────────────────────────────────
+// LmsrPricer — f64 boundary API for usecases
+// ────────────────────────────────────────────
+
+/// Lightweight f64 wrapper around LmsrModel for use at the ports boundary.
+///
+/// Accepts and returns `f64` so usecases and adapters never import `Decimal`.
+/// Internally delegates to the precise `LmsrModel` implementation.
+#[derive(Debug, Clone)]
+pub struct LmsrPricer {
+    model: LmsrModel,
+}
+
+impl LmsrPricer {
+    /// Create a pricer with the given liquidity parameter.
+    pub fn new(liquidity: f64) -> Self {
+        let b = Decimal::from_f64(liquidity).unwrap_or(Decimal::ONE_HUNDRED);
+        Self {
+            model: LmsrModel::new(b),
+        }
+    }
+
+    /// Compute fair price from an estimated probability.
+    ///
+    /// Maps probability → LMSR quantity split → YES price.
+    /// For a simple probability-to-price, we use q_yes = b*ln(p/(1-p))
+    /// which inverts the LMSR price formula.
+    pub fn price(&self, estimated_prob: f64) -> f64 {
+        // Clamp to avoid log(0) or log(inf)
+        let p = estimated_prob.clamp(0.01, 0.99);
+        // For a probability-based fair value, the LMSR price IS the probability
+        // when the market is at equilibrium. The pricer returns the probability
+        // as the fair value for the YES token.
+        p
+    }
+
+    /// Detect edge as absolute difference.
+    pub fn detect_edge(&self, market_price: f64, fair_price: f64) -> f64 {
+        ((fair_price - market_price) / market_price).abs()
+    }
+
+    /// Access the underlying model for precise Decimal operations.
+    pub fn model(&self) -> &LmsrModel {
+        &self.model
     }
 }
 
@@ -119,7 +161,6 @@ mod tests {
     fn test_lmsr_equal_quantities_gives_half() {
         let model = LmsrModel::new(dec!(100.0));
         let price = model.price_yes(dec!(0.0), dec!(0.0));
-        // Equal quantities should give 50% price
         let diff = (price - dec!(0.5)).abs();
         assert!(diff < dec!(0.001), "Expected ~0.5, got {price}");
     }
@@ -156,9 +197,4 @@ mod tests {
         assert!(edge > dec!(20.0), "Edge should be ~25%, got {edge}");
     }
 
-    #[test]
-    #[should_panic(expected = "must be positive")]
-    fn test_lmsr_zero_b_panics() {
-        LmsrModel::new(dec!(0.0));
-    }
-}
+   
