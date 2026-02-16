@@ -1,7 +1,7 @@
 [package]
 name = "polymarket-lmsr-bot"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.82"
 description = "LMSR-based market making bot for Polymarket prediction markets"
 license = "MIT"
