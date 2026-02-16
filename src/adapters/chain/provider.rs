@@ -23,6 +23,7 @@ pub struct PolygonProvider {
     /// The alloy HTTP provider connected to Polygon RPC.
     provider: Arc<RootProvider<Http<Client>>>,
     /// RPC endpoint URL (for diagnostics, never logged with secrets).
+    #[allow(dead_code)]
     rpc_url: String,
 }
 
@@ -36,10 +37,9 @@ impl PolygonProvider {
     pub async fn connect(config: &ApiConfig) -> Result<Self> {
         let rpc_url = config.rpc_url.clone();
 
+        // NOTE: on_http() is synchronous in alloy 0.9 — no .await
         let provider = ProviderBuilder::new()
-            .on_http(rpc_url.parse().context("Invalid RPC URL")?)
-            .await
-            .context("Failed to connect to Polygon RPC")?;
+            .on_http(rpc_url.parse().context("Invalid RPC URL")?);
 
         let provider = Arc::new(provider);
 

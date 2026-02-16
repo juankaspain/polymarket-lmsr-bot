@@ -1,148 +1,120 @@
-//! CLOB Order Execution Adapter - Polymarket REST API
+//! CLOB Order Executor — Adapter for Order Placement
 //!
-//! Implements the `OrderExecution` port for the Polymarket CLOB.
-//! All orders are maker-only (GTC + post-only) to guarantee 0% fees + rebates.
-//! Uses reqwest with rustls for HTTPS, API key + secret from env vars.
+//! Implements the `OrderExecution` port using the shared `ClobClient`
+//! for authenticated requests. All orders use maker-first strategy
+//! (GTC + post-only) for 0% fees + rebates.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use governor::{Quota, RateLimiter};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
-use crate::config::ApiConfig;
-use crate::domain::trade::{Order, OrderType, TradeSide, TokenId, OrderId};
+use super::client::ClobClient;
+use super::orderbook::OrderBookAdapter;
+use crate::domain::trade::{Order, OrderId, TokenId, TradeSide};
 use crate::ports::execution::{
     OrderCancellation, OrderExecution, OrderPlacement, OrderStatus,
 };
 
-/// CLOB API request for placing an order.
-#[derive(Debug, Serialize)]
-struct PlaceOrderRequest {
-    token_id: String,
-    price: f64,
-    size: f64,
-    side: String,
-    #[serde(rename = "type")]
-    order_type: String,
-    /// Always true for maker-first strategy.
-    post_only: bool,
-    /// GTD expiration in seconds (90s per checklist).
-    expiration: Option<u64>,
-}
+/// Maximum slippage tolerance before skipping trade (checklist: 2%).
+const MAX_SLIPPAGE_PCT: f64 = 2.0;
 
-/// CLOB API response from order placement.
-#[derive(Debug, Deserialize)]
-struct PlaceOrderResponse {
-    #[serde(rename = "orderID")]
-    order_id: String,
-    success: bool,
-    #[serde(default)]
-    error_msg: Option<String>,
-    #[serde(default)]
-    timestamp_ms: Option<u64>,
-}
-
-/// CLOB API response for order status query.
-#[derive(Debug, Deserialize)]
-struct OrderStatusResponse {
-    status: String,
-    #[serde(default)]
-    original_size: Option<f64>,
-    #[serde(default)]
-    remaining_size: Option<f64>,
-    #[serde(default)]
-    filled_size: Option<f64>,
-    #[serde(default)]
-    avg_price: Option<f64>,
-}
-
-/// CLOB API response for cancel.
-#[derive(Debug, Deserialize)]
-struct CancelOrderResponse {
-    success: bool,
-    #[serde(default)]
-    error_msg: Option<String>,
-}
-
-/// Polymarket CLOB order execution adapter.
+/// CLOB order executor backed by the shared authenticated client.
 ///
-/// Connects to the Polymarket CLOB REST API for order lifecycle
-/// management. Enforces maker-only placement and rate limiting.
+/// Uses `ClobClient` for all HTTP requests (inherits HMAC auth,
+/// retry logic, and rate limiting). Never creates its own reqwest client.
 pub struct ClobOrderExecutor {
-    /// HTTP client with rustls TLS backend.
-    client: Client,
-    /// CLOB base URL from config.
-    base_url: String,
-    /// API key from environment.
-    api_key: String,
-    /// API secret from environment.
-    api_secret: String,
-    /// Rate limiter: 50 orders/min budget (limit=60 actual).
-    rate_limiter: Arc<RateLimiter<
-        governor::state::NotKeyed,
-        governor::state::InMemoryState,
-        governor::clock::DefaultClock,
-    >>,
-    /// Rolling order count for budget tracking.
+    /// Shared CLOB client with auth + retry.
+    client: Arc<ClobClient>,
+    /// Order book adapter for pre-trade slippage checks.
+    orderbook: OrderBookAdapter,
+    /// Orders placed this minute for rate tracking.
     orders_this_minute: AtomicU32,
+    /// Last minute reset timestamp.
+    minute_reset: std::sync::Mutex<Instant>,
 }
 
 impl ClobOrderExecutor {
-    /// Create a new CLOB executor from config and env credentials.
-    ///
-    /// Reads `POLYMARKET_API_KEY` and `POLYMARKET_API_SECRET` from
-    /// environment variables. Panics if not set.
-    pub fn new(config: &ApiConfig) -> Result<Self> {
-        let api_key = std::env::var("POLYMARKET_API_KEY")
-            .context("POLYMARKET_API_KEY not set")?;
-        let api_secret = std::env::var("POLYMARKET_API_SECRET")
-            .context("POLYMARKET_API_SECRET not set")?;
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_seconds))
-            .build()
-            .context("Failed to build HTTP client")?;
-
-        // 50 orders per 60 seconds budget (API hard limit is 60)
-        let quota = Quota::per_minute(std::num::NonZeroU32::new(50).unwrap());
-        let rate_limiter = Arc::new(RateLimiter::direct(quota));
-
-        Ok(Self {
+    /// Create a new order executor.
+    pub fn new(client: Arc<ClobClient>) -> Self {
+        Self {
+            orderbook: OrderBookAdapter::new(Arc::clone(&client)),
             client,
-            base_url: config.clob_url.clone(),
-            api_key,
-            api_secret,
-            rate_limiter,
             orders_this_minute: AtomicU32::new(0),
-        })
+            minute_reset: std::sync::Mutex::new(Instant::now()),
+        }
     }
 
-    /// Build authorization headers for CLOB API.
-    fn auth_headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            "POLY-API-KEY",
-            self.api_key.parse().unwrap_or_default(),
-        );
-        headers.insert(
-            "POLY-API-SECRET",
-            self.api_secret.parse().unwrap_or_default(),
-        );
-        headers
+    /// Reset the per-minute order counter if a minute has elapsed.
+    fn maybe_reset_minute_counter(&self) {
+        let mut reset = self.minute_reset.lock().unwrap();
+        if reset.elapsed().as_secs() >= 60 {
+            self.orders_this_minute.store(0, Ordering::Relaxed);
+            *reset = Instant::now();
+        }
     }
 
-    /// Get current epoch millis for timestamps.
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+    /// Check orderbook depth and slippage before trade (checklist requirement).
+    ///
+    /// Returns Ok(avg_fill_price) if slippage is acceptable, Err if >2%.
+    async fn check_slippage(
+        &self,
+        token_id: &str,
+        side: TradeSide,
+        size: f64,
+    ) -> Result<f64> {
+        let book = self
+            .orderbook
+            .get_order_book(token_id)
+            .await
+            .context("Failed to fetch orderbook for slippage check")?;
+
+        let levels = match side {
+            TradeSide::Buy => &book.asks,
+            TradeSide::Sell => &book.bids,
+        };
+
+        if levels.is_empty() {
+            bail!("No orderbook depth for {token_id} on {:?} side", side);
+        }
+
+        // Compute weighted average fill price
+        let mut remaining = size;
+        let mut total_cost = 0.0;
+
+        for level in levels {
+            let fill = remaining.min(level.size);
+            total_cost += fill * level.price;
+            remaining -= fill;
+            if remaining <= 0.0 {
+                break;
+            }
+        }
+
+        if remaining > 0.0 {
+            bail!(
+                "Insufficient orderbook depth: {:.2} unfilled of {:.2}",
+                remaining,
+                size
+            );
+        }
+
+        let avg_fill = total_cost / size;
+        let best_price = levels[0].price;
+        let slippage_pct = ((avg_fill - best_price) / best_price).abs() * 100.0;
+
+        if slippage_pct > MAX_SLIPPAGE_PCT {
+            bail!(
+                "Slippage {:.2}% exceeds {:.1}% threshold",
+                slippage_pct,
+                MAX_SLIPPAGE_PCT,
+            );
+        }
+
+        Ok(avg_fill)
     }
 }
 
@@ -150,254 +122,246 @@ impl ClobOrderExecutor {
 impl OrderExecution for ClobOrderExecutor {
     #[instrument(skip(self, order), fields(token = %order.token_id, price = order.price, size = order.size))]
     async fn place_order(&self, order: &Order) -> Result<OrderPlacement> {
-        // Rate limit enforcement
-        self.rate_limiter.until_ready().await;
+        // Reset minute counter if needed
+        self.maybe_reset_minute_counter();
 
+        // Rate limit check (budget: 50 ord/min, hard limit 60)
+        let current = self.orders_this_minute.load(Ordering::Relaxed);
+        if current >= 50 {
+            warn!(current, "Order rate limit reached (50/min)");
+            return Ok(OrderPlacement {
+                order_id: String::new(),
+                accepted: false,
+                rejection_reason: Some("Rate limit: 50 orders/min".to_string()),
+                timestamp_ms: 0,
+            });
+        }
+
+        // Pre-trade slippage check (checklist: check_orderbook_depth BEFORE trade)
+        if let Err(e) = self.check_slippage(&order.token_id, order.side, order.size).await {
+            warn!(error = %e, "Slippage check failed, skipping order");
+            return Ok(OrderPlacement {
+                order_id: String::new(),
+                accepted: false,
+                rejection_reason: Some(format!("Slippage: {e}")),
+                timestamp_ms: 0,
+            });
+        }
+
+        // Build order payload — all orders are GTC + post-only (maker)
         let side_str = match order.side {
             TradeSide::Buy => "BUY",
             TradeSide::Sell => "SELL",
         };
 
-        // GTD with 90s expiration per checklist (NEVER GTC)
-        let request = PlaceOrderRequest {
-            token_id: order.token_id.clone(),
-            price: order.price,
-            size: order.size,
-            side: side_str.to_string(),
-            order_type: "GTD".to_string(),
-            post_only: true,
-            expiration: Some(90),
-        };
+        let payload = serde_json::json!({
+            "tokenID": order.token_id,
+            "price": format!("{:.2}", order.price),
+            "size": format!("{:.2}", order.size),
+            "side": side_str,
+            "type": "GTC",
+            "postOnly": true,
+        });
 
-        let url = format!("{}/order", self.base_url);
+        let body = serde_json::to_string(&payload)?;
 
+        // Use shared ClobClient which handles HMAC auth automatically
         let response = self
             .client
-            .post(&url)
-            .headers(self.auth_headers())
-            .json(&request)
-            .send()
+            .post("/order", &body)
             .await
-            .context("CLOB place_order request failed")?;
+            .context("Failed to place order via CLOB")?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("CLOB place_order HTTP {status}: {body}");
+        // Parse response
+        let order_id = response["orderID"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        let accepted = response["success"].as_bool().unwrap_or(false);
+        let rejection_reason = if !accepted {
+            response["errorMsg"].as_str().map(String::from)
+        } else {
+            None
+        };
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if accepted {
+            self.orders_this_minute.fetch_add(1, Ordering::Relaxed);
+            info!(order_id = %order_id, "Order placed successfully");
+        } else {
+            warn!(reason = ?rejection_reason, "Order rejected by CLOB");
         }
 
-        let resp: PlaceOrderResponse = response
-            .json()
-            .await
-            .context("Failed to parse place_order response")?;
-
-        self.orders_this_minute.fetch_add(1, Ordering::Relaxed);
-
         Ok(OrderPlacement {
-            order_id: resp.order_id,
-            accepted: resp.success,
-            rejection_reason: resp.error_msg,
-            timestamp_ms: resp.timestamp_ms.unwrap_or_else(Self::now_ms),
+            order_id,
+            accepted,
+            rejection_reason,
+            timestamp_ms,
         })
     }
 
-    #[instrument(skip(self), fields(order_id = %order_id))]
+    #[instrument(skip(self))]
     async fn cancel_order(&self, order_id: &OrderId) -> Result<OrderCancellation> {
-        let url = format!("{}/order/{}", self.base_url, order_id);
+        let payload = serde_json::json!({ "orderID": order_id });
+        let body = serde_json::to_string(&payload)?;
 
         let response = self
             .client
-            .delete(&url)
-            .headers(self.auth_headers())
-            .send()
+            .delete("/order", &body)
             .await
-            .context("CLOB cancel_order request failed")?;
+            .context("Failed to cancel order")?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            warn!(http_status = %status, "Cancel order failed: {body}");
-            return Ok(OrderCancellation {
-                order_id: order_id.clone(),
-                success: false,
-                error: Some(format!("HTTP {status}: {body}")),
-            });
-        }
-
-        let resp: CancelOrderResponse = response
-            .json()
-            .await
-            .context("Failed to parse cancel_order response")?;
+        let success = response["success"].as_bool().unwrap_or(false);
 
         Ok(OrderCancellation {
             order_id: order_id.clone(),
-            success: resp.success,
-            error: resp.error_msg,
+            success,
+            error: if !success {
+                response["errorMsg"].as_str().map(String::from)
+            } else {
+                None
+            },
         })
     }
 
     #[instrument(skip(self))]
     async fn cancel_all_orders(&self) -> Result<usize> {
-        let url = format!("{}/orders/cancel-all", self.base_url);
-
         let response = self
             .client
-            .delete(&url)
-            .headers(self.auth_headers())
-            .send()
+            .delete("/order/all", "")
             .await
-            .context("CLOB cancel_all request failed")?;
+            .context("Failed to cancel all orders")?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("CLOB cancel_all HTTP {status}: {body}");
-        }
+        let count = response["cancelled"]
+            .as_u64()
+            .unwrap_or(0) as usize;
 
-        #[derive(Deserialize)]
-        struct CancelAllResponse {
-            cancelled: usize,
-        }
-
-        let resp: CancelAllResponse = response.json().await?;
-        info!(cancelled = resp.cancelled, "All orders cancelled");
-        Ok(resp.cancelled)
+        info!(cancelled = count, "Cancelled all open orders");
+        Ok(count)
     }
 
-    #[instrument(skip(self), fields(token_id = %token_id))]
     async fn cancel_orders_for_token(
         &self,
         token_id: &TokenId,
     ) -> Result<Vec<OrderCancellation>> {
-        // Get open orders for this token, then cancel each
-        let open = self.get_open_orders().await?;
-        let mut results = Vec::new();
-
-        for order in open.iter().filter(|o| o.token_id == *token_id) {
-            let result = self.cancel_order(&order.id).await?;
-            results.push(result);
-        }
-
-        Ok(results)
-    }
-
-    #[instrument(skip(self), fields(order_id = %order_id))]
-    async fn get_order_status(&self, order_id: &OrderId) -> Result<OrderStatus> {
-        let url = format!("{}/order/{}", self.base_url, order_id);
+        let payload = serde_json::json!({ "tokenID": token_id });
+        let body = serde_json::to_string(&payload)?;
 
         let response = self
             .client
-            .get(&url)
-            .headers(self.auth_headers())
-            .send()
+            .delete("/order/token", &body)
             .await
-            .context("CLOB get_order_status request failed")?;
+            .context("Failed to cancel orders for token")?;
 
-        let resp: OrderStatusResponse = response
-            .json()
+        let cancelled = response["cancelled"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|id| OrderCancellation {
+                        order_id: id.to_string(),
+                        success: true,
+                        error: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(cancelled)
+    }
+
+    async fn get_order_status(&self, order_id: &OrderId) -> Result<OrderStatus> {
+        let path = format!("/order/{}", order_id);
+        let response = self
+            .client
+            .get(&path)
             .await
-            .context("Failed to parse order status")?;
+            .context("Failed to get order status")?;
 
-        let status = match resp.status.as_str() {
-            "OPEN" | "LIVE" => OrderStatus::Open {
-                remaining_size: resp.remaining_size.unwrap_or(0.0),
-                original_size: resp.original_size.unwrap_or(0.0),
-            },
-            "FILLED" | "MATCHED" => OrderStatus::Filled {
-                avg_price: resp.avg_price.unwrap_or(0.0),
-                filled_size: resp.filled_size.unwrap_or(0.0),
-            },
-            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled {
-                filled_size: resp.filled_size.unwrap_or(0.0),
-                remaining_size: resp.remaining_size.unwrap_or(0.0),
-                avg_price: resp.avg_price.unwrap_or(0.0),
-            },
-            "CANCELLED" | "EXPIRED" => OrderStatus::Cancelled,
+        let status_str = response["status"].as_str().unwrap_or("UNKNOWN");
+
+        let status = match status_str {
+            "LIVE" | "OPEN" => {
+                let remaining = response["remaining_size"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                let original = response["original_size"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                OrderStatus::Open {
+                    remaining_size: remaining,
+                    original_size: original,
+                }
+            }
+            "FILLED" => {
+                let avg = response["avg_price"].as_f64().unwrap_or(0.0);
+                let filled = response["filled_size"].as_f64().unwrap_or(0.0);
+                OrderStatus::Filled {
+                    avg_price: avg,
+                    filled_size: filled,
+                }
+            }
+            "CANCELLED" => OrderStatus::Cancelled,
             _ => OrderStatus::Unknown,
         };
 
         Ok(status)
     }
 
-    #[instrument(skip(self))]
     async fn get_open_orders(&self) -> Result<Vec<Order>> {
-        let url = format!("{}/orders/open", self.base_url);
-
         let response = self
             .client
-            .get(&url)
-            .headers(self.auth_headers())
-            .send()
+            .get("/orders/open")
             .await
-            .context("CLOB get_open_orders request failed")?;
+            .context("Failed to get open orders")?;
 
-        #[derive(Deserialize)]
-        struct OpenOrder {
-            #[serde(rename = "orderID")]
-            order_id: String,
-            token_id: String,
-            side: String,
-            price: f64,
-            size: f64,
-            #[serde(default)]
-            timestamp_ms: u64,
-        }
-
-        let orders: Vec<OpenOrder> = response.json().await?;
-
-        Ok(orders
-            .into_iter()
-            .map(|o| Order {
-                id: o.order_id,
-                token_id: o.token_id,
-                side: if o.side == "BUY" {
-                    TradeSide::Buy
-                } else {
-                    TradeSide::Sell
-                },
-                price: o.price,
-                size: o.size,
-                order_type: OrderType::Gtc,
-                post_only: true,
-                timestamp_ms: o.timestamp_ms,
+        let orders = response
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
             })
-            .collect())
+            .unwrap_or_default();
+
+        Ok(orders)
     }
 
-    #[instrument(skip(self))]
     async fn available_balance(&self, _side: TradeSide) -> Result<f64> {
-        let url = format!("{}/balance", self.base_url);
-
         let response = self
             .client
-            .get(&url)
-            .headers(self.auth_headers())
-            .send()
+            .get("/balance")
             .await
-            .context("CLOB balance query failed")?;
+            .context("Failed to get balance")?;
 
-        #[derive(Deserialize)]
-        struct BalanceResponse {
-            balance: f64,
-        }
+        let balance = response["available"]
+            .as_f64()
+            .unwrap_or(0.0);
 
-        let resp: BalanceResponse = response.json().await?;
-        Ok(resp.balance)
+        Ok(balance)
     }
 
     async fn is_healthy(&self) -> bool {
-        let url = format!("{}/health", self.base_url);
-        self.client
-            .get(&url)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        self.client.get("/time").await.is_ok()
     }
 
     async fn rate_limit_status(&self) -> (u32, u64) {
+        self.maybe_reset_minute_counter();
         let used = self.orders_this_minute.load(Ordering::Relaxed);
         let remaining = 50u32.saturating_sub(used);
-        (remaining, Self::now_ms() + 60_000)
+        let reset = self
+            .minute_reset
+            .lock()
+            .map(|r| {
+                let elapsed = r.elapsed().as_millis() as u64;
+                60_000u64.saturating_sub(elapsed)
+            })
+            .unwrap_or(0);
+        (remaining, reset)
     }
 }

@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, Bytes, keccak256};
+use alloy::rpc::types::TransactionRequest;
+use alloy::providers::Provider;
 use anyhow::{Context, Result};
 use tracing::{info, instrument, warn};
 
@@ -101,21 +103,26 @@ impl ApprovalManager {
         let inner = self.provider.inner();
 
         // Build allowance(owner, spender) calldata
+        let selector = &keccak256(b"allowance(address,address)")[..4];
         let mut calldata = Vec::with_capacity(68);
-        calldata.extend_from_slice(
-            &alloy::primitives::keccak256(b"allowance(address,address)")[..4],
-        );
-        calldata.extend_from_slice(&[0u8; 12]); // left pad owner
-        calldata.extend_from_slice(self.wallet.as_slice());
-        calldata.extend_from_slice(&[0u8; 12]); // left pad spender
-        calldata.extend_from_slice(spender.as_slice());
+        calldata.extend_from_slice(selector);
+
+        // Left-pad owner address to 32 bytes
+        let mut owner_padded = [0u8; 32];
+        owner_padded[12..].copy_from_slice(self.wallet.as_slice());
+        calldata.extend_from_slice(&owner_padded);
+
+        // Left-pad spender address to 32 bytes
+        let mut spender_padded = [0u8; 32];
+        spender_padded[12..].copy_from_slice(spender.as_slice());
+        calldata.extend_from_slice(&spender_padded);
+
+        let tx = TransactionRequest::default()
+            .to(token)
+            .input(Bytes::from(calldata).into());
 
         let result = inner
-            .call(
-                &alloy::rpc::types::TransactionRequest::default()
-                    .to(token)
-                    .input(alloy::primitives::Bytes::from(calldata).into()),
-            )
+            .call(&tx)
             .await
             .context("Allowance query failed")?;
 
@@ -136,7 +143,7 @@ impl ApprovalManager {
         // with EIP-1559 fees from gas_oracle (tip 30 gwei, max 50 gwei)
         let _gas_gwei = self.gas_oracle.current_gas_gwei().await?;
 
-        // Placeholder for actual tx submission with signer
+        // TODO: Actual tx submission requires wallet signer integration
         warn!("Approval tx submission requires wallet signer — placeholder");
 
         Ok(true)

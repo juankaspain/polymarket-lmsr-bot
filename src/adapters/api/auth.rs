@@ -1,123 +1,127 @@
-//! CLOB API Authentication - EIP-712 Signature-based Auth
+//! CLOB Authentication — HMAC-SHA256 Request Signing
 //!
-//! Handles Polymarket API authentication using EIP-712 typed data
-//! signatures. The bot signs API credentials and order payloads
-//! using the configured private key.
+//! Signs every CLOB API request using HMAC-SHA256 per the Polymarket
+//! CLOB specification. Credentials come from environment variables
+//! (POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
 use anyhow::{Context, Result};
-use tracing::debug;
+use base64::Engine;
 
-/// API authentication credentials derived from wallet signature.
-#[derive(Debug, Clone)]
-pub struct ApiCredentials {
-  /// API key provided by Polymarket.
-  pub api_key: String,
-  /// API secret for HMAC signing.
-  pub api_secret: String,
-  /// Passphrase for additional auth layer.
-  pub api_passphrase: String,
-}
+/// Thread-safe nonce generator: timestamp_seed + atomic counter.
+///
+/// Guarantees unique nonces even for concurrent requests within
+/// the same millisecond. Seed is set once at construction from
+/// system clock; counter increments atomically per request.
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Manages EIP-712 signing for CLOB API authentication.
+/// CLOB API authentication handler.
+///
+/// Manages API key, secret, and passphrase loaded from env vars.
+/// Signs requests using HMAC-SHA256 as required by Polymarket CLOB.
 pub struct ClobAuth {
-  /// The wallet signer (private key).
-  signer: PrivateKeySigner,
-  /// Cached API credentials.
-  credentials: Option<ApiCredentials>,
-  /// Chain ID for EIP-712 domain separator (137 = Polygon).
-  chain_id: u64,
+    /// API key from POLY_API_KEY env var.
+    api_key: String,
+    /// API secret from POLY_API_SECRET env var (never sent in headers).
+    api_secret: String,
+    /// Passphrase from POLY_PASSPHRASE env var.
+    passphrase: String,
+    /// Timestamp seed set at construction for nonce generation.
+    nonce_seed: u64,
 }
 
 impl ClobAuth {
-  /// Create a new auth manager from a private key hex string.
-  pub fn new(private_key_hex: &str, chain_id: u64) -> Result<Self> {
-    let signer: PrivateKeySigner = private_key_hex
-      .parse()
-      .context("Failed to parse private key")?;
+    /// Load credentials from environment variables.
+    ///
+    /// Required env vars: POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE.
+    /// These MUST be set in `.env` (never committed to git).
+    pub fn from_env() -> Result<Self> {
+        let api_key = std::env::var("POLY_API_KEY")
+            .context("POLY_API_KEY not set")?;
+        let api_secret = std::env::var("POLY_API_SECRET")
+            .context("POLY_API_SECRET not set")?;
+        let passphrase = std::env::var("POLY_PASSPHRASE")
+            .context("POLY_PASSPHRASE not set")?;
 
-    debug!(
-      address = %signer.address(),
-      "Auth manager initialized"
-    );
+        let nonce_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
-    Ok(Self {
-      signer,
-      credentials: None,
-      chain_id,
-    })
-  }
+        Ok(Self {
+            api_key,
+            api_secret,
+            passphrase,
+            nonce_seed,
+        })
+    }
 
-  /// Get the wallet address as a hex string.
-  pub fn address(&self) -> String {
-    format!("{:?}", self.signer.address())
-  }
+    /// Get the API key for request headers.
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
 
-  /// Set pre-existing API credentials (from env vars).
-  pub fn set_credentials(&mut self, credentials: ApiCredentials) {
-    self.credentials = Some(credentials);
-  }
+    /// Get the passphrase for request headers.
+    pub fn passphrase(&self) -> &str {
+        &self.passphrase
+    }
 
-  /// Get a reference to stored credentials.
-  pub fn credentials(&self) -> Option<&ApiCredentials> {
-    self.credentials.as_ref()
-  }
+    /// Generate a unique nonce using timestamp_seed + atomic increment.
+    ///
+    /// This ensures no two requests share a nonce even under
+    /// high concurrency (checklist: nonce=timestamp_seed+atomic_fetch_add).
+    pub fn generate_nonce(&self) -> u64 {
+        let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.nonce_seed + counter
+    }
 
-  /// Generate a HMAC signature for API requests.
-  ///
-  /// The CLOB API requires HMAC-SHA256 signatures on request
-  /// timestamps and payloads for authenticated endpoints.
-  pub fn sign_request(
-    &self,
-    timestamp: &str,
-    method: &str,
-    path: &str,
-    body: &str,
-  ) -> Result<String> {
-    let credentials = self
-      .credentials
-      .as_ref()
-      .context("API credentials not set")?;
+    /// Generate the current Unix timestamp in seconds (for signing).
+    pub fn timestamp(&self) -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string()
+    }
 
-    let message = format!("{}{}{}{}", timestamp, method.to_uppercase(), path, body);
+    /// Sign a request using HMAC-SHA256.
+    ///
+    /// Signature format: HMAC-SHA256(secret, timestamp + method + path + body)
+    /// The secret is NEVER sent as a header — only the computed signature.
+    pub fn sign(
+        &self,
+        timestamp: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> String {
+        let message = format!("{}{}{}{}", timestamp, method, path, body);
+        let mac = hmac_sha256::HMAC::mac(
+            message.as_bytes(),
+            self.api_secret.as_bytes(),
+        );
+        base64::engine::general_purpose::STANDARD.encode(mac)
+    }
 
-    let key = hmac_sha256::HMAC::mac(
-      message.as_bytes(),
-      credentials.api_secret.as_bytes(),
-    );
-
-    Ok(base64::Engine::encode(
-      &base64::engine::general_purpose::STANDARD,
-      key,
-    ))
-  }
-
-  /// Generate the current timestamp string for API requests.
-  pub fn timestamp() -> String {
-    let now = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .expect("Time went backwards");
-    now.as_secs().to_string()
-  }
-
-  /// Generate a nonce for order signing.
-  pub fn generate_nonce() -> u64 {
-    SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .expect("Time went backwards")
-      .as_millis() as u64
-  }
-
-  /// Get the underlying signer for direct EIP-712 signing.
-  pub fn signer(&self) -> &PrivateKeySigner {
-    &self.signer
-  }
-
-  /// Get the chain ID.
-  pub fn chain_id(&self) -> u64 {
-    self.chain_id
-  }
+    /// Build all authentication headers for a CLOB request.
+    ///
+    /// Returns (key, timestamp, signature, passphrase) tuple.
+    /// The API secret is NEVER included — only the HMAC signature.
+    pub fn auth_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (String, String, String, String) {
+        let timestamp = self.timestamp();
+        let signature = self.sign(&timestamp, method, path, body);
+        (
+            self.api_key.clone(),
+            timestamp,
+            signature,
+            self.passphrase.clone(),
+        )
+    }
 }

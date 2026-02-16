@@ -7,8 +7,9 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, Bytes, keccak256};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tracing::{info, instrument, warn};
@@ -33,7 +34,7 @@ pub struct ContractAddresses {
 ///
 /// Handles balance queries, condition resolution checks, and batch
 /// redemptions. All contract addresses are loaded from config and
-/// validated at startup (code existence + basic ABI check).
+/// validated at startup (code existence check).
 pub struct CtfContracts {
     /// Shared Polygon RPC provider.
     provider: Arc<PolygonProvider>,
@@ -54,7 +55,6 @@ impl CtfContracts {
         gas_oracle: Arc<GasOracle>,
         addresses: ContractAddresses,
     ) -> Result<Self> {
-        // Validate contracts exist on-chain
         let inner = provider.inner();
 
         for (name, addr) in [
@@ -83,40 +83,44 @@ impl CtfContracts {
             addresses,
         })
     }
+
+    /// Build ABI-encoded calldata for `balanceOf(address)` (ERC-20).
+    fn encode_balance_of(wallet: Address) -> Bytes {
+        let selector = &keccak256(b"balanceOf(address)")[..4];
+        let mut calldata = Vec::with_capacity(36);
+        calldata.extend_from_slice(selector);
+        // Left-pad address to 32 bytes
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(wallet.as_slice());
+        calldata.extend_from_slice(&padded);
+        Bytes::from(calldata)
+    }
 }
 
 #[async_trait]
 impl ChainClient for CtfContracts {
     #[instrument(skip(self))]
     async fn usdc_balance(&self) -> Result<f64> {
-        // ERC-20 balanceOf call for USDCe (6 decimals)
         let inner = self.provider.inner();
 
-        // Build balanceOf calldata: 0x70a08231 + address padded
-        let wallet = std::env::var("WALLET_ADDRESS")
+        let wallet_str = std::env::var("WALLET_ADDRESS")
             .context("WALLET_ADDRESS not set")?;
-        let wallet_addr: Address = wallet.parse().context("Invalid wallet address")?;
+        let wallet_addr: Address = wallet_str.parse().context("Invalid wallet address")?;
 
-        // Using raw call for USDCe balanceOf
-        let calldata = alloy::primitives::Bytes::from(
-            [
-                &alloy::primitives::keccak256(b"balanceOf(address)")[..4],
-                &alloy::primitives::LeftPadded::<20>::from(wallet_addr).0[..],
-            ]
-            .concat(),
-        );
+        let calldata = Self::encode_balance_of(wallet_addr);
+
+        let tx = TransactionRequest::default()
+            .to(self.addresses.usdce)
+            .input(calldata.into());
 
         let result = inner
-            .call(
-                &alloy::rpc::types::TransactionRequest::default()
-                    .to(self.addresses.usdce)
-                    .input(calldata.into()),
-            )
+            .call(&tx)
             .await
             .context("USDCe balanceOf call failed")?;
 
         let balance_raw = U256::from_be_slice(&result);
-        let balance = balance_raw.to::<u128>() as f64 / 1_000_000.0; // 6 decimals
+        // USDCe has 6 decimals
+        let balance = balance_raw.to::<u128>() as f64 / 1_000_000.0;
 
         Ok(balance)
     }
@@ -124,11 +128,10 @@ impl ChainClient for CtfContracts {
     #[instrument(skip(self), fields(token_id = %token_id))]
     async fn token_balance(&self, token_id: &str) -> Result<TokenBalance> {
         // CTF Exchange balanceOf(address, tokenId) — ERC-1155 style
-        let wallet = std::env::var("WALLET_ADDRESS")
+        // TODO: Implement full ERC-1155 ABI encoding
+        let _wallet = std::env::var("WALLET_ADDRESS")
             .context("WALLET_ADDRESS not set")?;
-        let _wallet_addr: Address = wallet.parse().context("Invalid wallet address")?;
 
-        // Simplified: return zero balance; full impl requires ERC-1155 ABI encoding
         Ok(TokenBalance {
             token_id: token_id.to_string(),
             balance_raw: 0,
@@ -163,8 +166,9 @@ impl ChainClient for CtfContracts {
             "Submitting batch redemption"
         );
 
-        // Placeholder: actual tx submission requires full ABI + signer setup
-        // In production this would encode redeemPositions() calldata and submit
+        // TODO: Actual tx submission requires full ABI + signer setup
+        // In production: encode redeemPositions() calldata, sign with
+        // EIP-1559 (tip 30 gwei, max 50 gwei), and submit.
         Ok(RedemptionResult {
             tx_hash: format!("0x_pending_{}", token_ids.len()),
             positions_redeemed: token_ids.len(),
@@ -175,10 +179,9 @@ impl ChainClient for CtfContracts {
 
     #[instrument(skip(self), fields(condition_id = %condition_id))]
     async fn is_condition_resolved(&self, condition_id: &str) -> Result<bool> {
-        // Query CTF Exchange payoutDenominator(conditionId)
+        // TODO: Query CTF Exchange payoutDenominator(conditionId)
         // Non-zero denominator means resolved
         let _ = condition_id;
-        // Placeholder: full impl requires ABI encoding for getConditionResolution
         Ok(false)
     }
 

@@ -11,8 +11,11 @@ pub mod lmsr;
 pub mod trade;
 
 // Re-export core types for convenience
-pub use trade::{Asset, Market, Order, OrderSide, OrderStatus, OrderType, Position, Trade};
-pub use lmsr::LmsrModel;
-pub use kelly::KellyCriterion;
-pub use fees::FeeCalculator;
 pub use bayesian::BayesianEstimator;
+pub use fees::FeeCalculator;
+pub use kelly::KellyCriterion;
+pub use lmsr::LmsrModel;
+pub use trade::{
+    Asset, BotMode, Market, Order, OrderSide, OrderStatus, OrderType, Position,
+    Trade, TradeSide,
+};

@@ -1,15 +1,7 @@
-//! Polymarket CLOB API Adapter
+//! CLOB API Adapters — HTTP and WebSocket clients for Polymarket.
 //!
-//! Implements the HTTP client for interacting with the Polymarket
-//! Central Limit Order Book (CLOB) REST API. Handles authentication,
-//! order placement, cancellation, and order book queries.
-//!
-//! Sub-modules:
-//! - `auth`: EIP-712 signature-based authentication
-//! - `client`: HTTP client with rate limiting and retries
-//! - `orderbook`: Order book snapshot retrieval
-//! - `orders`: Order placement and management
-//! - `types`: API request/response type definitions
+//! Contains the authenticated HTTP client, order executor, order book
+//! queries, and request/response types.
 
 pub mod auth;
 pub mod client;

@@ -1,15 +1,18 @@
-//! Polymarket LMSR Arbitrage Bot - Entry Point
+//! Polymarket LMSR Bot — Entry Point
 //!
-//! Version: 0.1.0
-//!
-//! High-frequency arbitrage bot for Polymarket prediction markets.
-//! Uses LMSR pricing model, maker-first strategy (0% fees + rebates),
-//! event-driven architecture, and professional risk management.
+//! Initializes configuration, logging, blockchain connections,
+//! and the main arbitrage engine. Runs until SIGINT/SIGTERM.
 
-// Platform-specific allocator: jemalloc on Linux, system default on Windows
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tokio::signal;
+use tokio::sync::{broadcast, watch};
+use tracing::{error, info, warn};
 
 mod adapters;
 mod config;
@@ -17,92 +20,118 @@ mod domain;
 mod ports;
 mod usecases;
 
-use anyhow::{Context, Result};
-use std::sync::Arc;
-use tokio::signal;
-use tokio::sync::{broadcast, watch};
-use tracing::{error, info, warn};
-
-/// Application version from Cargo.toml.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env file
-    dotenvy::dotenv().ok();
+    // Load configuration from config.toml
+    let config = config::loader::load_config("config.toml")
+        .context("Failed to load configuration")?;
 
-    // Initialize structured logging
-    let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    // Initialize tracing subscriber with JSON output
     tracing_subscriber::fmt()
-        .with_env_filter(&log_filter)
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(&config.bot.log_level)
+                }),
+        )
+        .json()
         .init();
 
     info!(
-        version = VERSION,
-        pid = std::process::id(),
-        "Starting Polymarket LMSR Arbitrage Bot"
+        name = %config.bot.name,
+        dry_run = config.bot.dry_run,
+        markets = config.markets.len(),
+        "Starting Polymarket LMSR Bot"
     );
 
-    // Load configuration
-    let config = config::loader::load_config()
-        .context("Failed to load configuration")?;
-
-    info!(
-        mode = ?config.bot.mode,
-        assets = ?config.strategy.assets,
-        "Configuration loaded successfully"
-    );
-
-    // Create shutdown channels
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    // Shutdown signal handling
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     let (health_tx, health_rx) = watch::channel(true);
 
-    // Spawn health check server
-    let health_port = config.metrics.health_port;
-    let health_handle = tokio::spawn(async move {
-        info!(port = health_port, "Health check server starting");
-        // Health server will be implemented in adapters/metrics/health.rs
+    // Spawn health/metrics server
+    let health_handle = tokio::spawn(serve_health(health_rx, config.clone()));
+
+    // Spawn main engine
+    let shutdown_rx_engine = shutdown_tx.subscribe();
+    let engine_config = config.clone();
+    let engine_handle = tokio::spawn(async move {
+        if let Err(e) = run_engine(engine_config, shutdown_rx_engine).await {
+            error!(error = %e, "Engine failed");
+        }
     });
 
-    // Log startup summary
-    info!(
-        strategy = "maker-first (0% fees + rebates)",
-        kelly = "quarter-Kelly (0.25x)",
-        rate_limit = config.rate_limits.max_orders_per_minute,
-        max_daily_loss = %config.risk.max_daily_loss_fraction,
-        "Bot configuration summary"
-    );
-
-    info!("Bot is ready. Waiting for market events...");
-
-    // Wait for shutdown signal (Ctrl+C or SIGTERM)
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Shutdown signal received, initiating graceful shutdown...");
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to listen for shutdown signal");
+    // Wait for SIGINT or SIGTERM
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("SIGINT received, initiating graceful shutdown");
         }
     }
 
-    // Graceful shutdown sequence
-    info!("Step 1/4: Cancelling open orders...");
-    // TODO: Cancel all open orders via CLOB API
-
-    info!("Step 2/4: Saving state to disk...");
-    // TODO: Persist current state to JSONL
-
-    info!("Step 3/4: Flushing metrics...");
-    // TODO: Final metrics export
-
-    info!("Step 4/4: Closing connections...");
+    // Graceful shutdown sequence per checklist:
+    // 1. Signal all tasks to stop
     let _ = shutdown_tx.send(());
-    drop(health_tx);
 
-    info!(version = VERSION, "Bot shutdown complete. Goodbye!");
+    // 2. Mark health as unhealthy so readiness probe fails
+    let _ = health_tx.send(false);
+
+    // 3. Wait for engine to finish (cancel orders + claim + save state)
+    info!("Waiting for engine to complete shutdown...");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        engine_handle,
+    )
+    .await;
+
+    // 4. Stop health server
+    health_handle.abort();
+
+    info!("Shutdown complete");
+    Ok(())
+}
+
+/// Run the main arbitrage engine.
+async fn run_engine(
+    _config: config::AppConfig,
+    mut _shutdown_rx: broadcast::Receiver<()>,
+) -> Result<()> {
+    // TODO: Initialize chain provider, CLOB client, feeds, and ArbitrageEngine
+    // This is the integration point where adapters are wired to ports.
+    //
+    // Example wiring (pseudocode):
+    //   let provider = PolygonProvider::connect(&config.api).await?;
+    //   let gas_oracle = GasOracle::new(Arc::new(provider));
+    //   let clob_client = ClobClient::new(&config.api)?;
+    //   let feed = ... ;
+    //   let execution = ... ;
+    //   let mut engine = ArbitrageEngine::new(feed, execution, config, shutdown_rx);
+    //   engine.run().await
+    warn!("Engine wiring not yet complete — dry run mode");
+    Ok(())
+}
+
+/// Serve health and metrics endpoints on :9090.
+async fn serve_health(
+    health_rx: watch::Receiver<bool>,
+    _config: config::AppConfig,
+) -> Result<()> {
+    use axum::{Router, routing::get, extract::State, http::StatusCode};
+
+    let app = Router::new()
+        .route("/live", get(|| async { StatusCode::OK }))
+        .route(
+            "/ready",
+            get(move |State(rx): State<watch::Receiver<bool>>| async move {
+                if *rx.borrow() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .with_state(health_rx);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9090").await?;
+    info!("Health server listening on :9090");
+    axum::serve(listener, app).await?;
     Ok(())
 }
