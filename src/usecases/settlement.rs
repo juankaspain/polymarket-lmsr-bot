@@ -68,6 +68,8 @@ pub struct SettlementReport {
 /// Settlement manager that handles batch redemption of resolved markets.
 pub struct Settlement<C: ChainClient, R: Repository> {
   chain: C,
+  /// Reserved for future settlement persistence (trade log of redemptions).
+  #[allow(dead_code)]
   repo: R,
   /// Minimum USDC value to trigger on-chain redemption (avoid dust).
   min_redemption_value: f64,

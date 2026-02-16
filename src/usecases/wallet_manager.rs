@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::domain::trade::TokenId;
 use crate::ports::chain_client::ChainClient;
 
 /// Snapshot of the wallet state at a point in time.
