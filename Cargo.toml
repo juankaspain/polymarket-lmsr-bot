@@ -20,9 +20,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # WebSocket (rustls to match reqwest — NEVER native-tls)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
-# Serialization — pinned to <1.0.228 (serde_core split breaks alloy 0.9)
-serde = { version = ">=1.0.171, <1.0.228", features = ["derive"] }
-serde_json = "1.0"
+# Serialization — pinned =1.0.219 (last version before serde_core split that breaks alloy 0.9)
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
 toml = "0.8"
 
 # Async traits (needed until Rust stabilizes async fn in traits for dyn dispatch)
